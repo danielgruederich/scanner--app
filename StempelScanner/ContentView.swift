@@ -9,7 +9,7 @@ import SwiftUI
 struct ContentView: View {
 
     @StateObject private var bluetooth = BLEService()
-    @StateObject private var appState = AppState()
+    @EnvironmentObject private var appState: AppState
 
     @State private var scanState: ScanState = .idle
     @State private var lastCode: String?
@@ -278,4 +278,5 @@ struct InfoRow: View {
 
 #Preview {
     ContentView()
+        .environmentObject(AppState())
 }
