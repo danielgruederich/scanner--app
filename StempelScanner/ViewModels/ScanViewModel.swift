@@ -1,101 +1,106 @@
 import Foundation
-import Combine
 
+@MainActor
 final class ScanViewModel: ObservableObject {
 
-    @Published var currentCard: Card?
-    @Published var scanHistory: [ScanResult] = []
-    @Published var isProcessing = false
-    @Published var statusMessage: String = "Wartet auf Scan..."
-    @Published var showSuccess = false
-    @Published var showError = false
-    @Published var errorMessage: String = ""
+    @Published var scanMode: ScanMode = .stamp
+    @Published var isLoading = false
+    @Published var lastCard: Card?
+    @Published var errorMessage: String?
+    @Published var successMessage: String?
+    @Published var availableRewards: [RewardTier] = []
+    @Published var showRewardPicker = false
 
-    let api: APIService
-    let offlineQueue: OfflineQueueService
-    let employeeName: String
+    private let apiService: APIService
+    private let offlineQueue: OfflineQueueService
+    private var pendingCardId: String?
 
-    init(api: APIService, offlineQueue: OfflineQueueService, employeeName: String) {
-        self.api = api
+    init(apiService: APIService, offlineQueue: OfflineQueueService) {
+        self.apiService = apiService
         self.offlineQueue = offlineQueue
-        self.employeeName = employeeName
     }
+
+    // MARK: - Called by BLEService when a barcode arrives
 
     func handleScan(cardId: String) {
-        guard !isProcessing else { return }
-        guard cardId.isValidCardID else {
-            showErrorMessage("Ungültiger Barcode")
-            return
-        }
+        guard !isLoading else { return }
+        clearMessages()
 
-        isProcessing = true
-        statusMessage = "Karte wird geladen..."
-
-        Task {
-            do {
-                let card = try await api.getCard(id: cardId)
-                await MainActor.run { self.currentCard = card }
-
-                let comment = "Stempel von: \(employeeName)"
-                let updatedCard = try await api.addStamp(cardId: cardId, stamps: 1, comment: comment)
-
-                let result = ScanResult(
-                    cardId: cardId,
-                    customerName: card.customer.firstName ?? "Unbekannt",
-                    stampsAdded: 1,
-                    currentStamps: updatedCard.balance.currentNumberOfUses ?? 0,
-                    totalStamps: updatedCard.balance.numberStampsTotal ?? 0,
-                    employeeName: employeeName
-                )
-
-                await MainActor.run {
-                    self.currentCard = updatedCard
-                    self.scanHistory.insert(result, at: 0)
-                    if self.scanHistory.count > 50 { self.scanHistory.removeLast() }
-                    self.statusMessage = "\(result.customerName) — \(result.currentStamps)/\(result.totalStamps) Stempel"
-                    self.showSuccess = true
-                    self.isProcessing = false
-                }
-
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
-                await MainActor.run {
-                    self.showSuccess = false
-                    self.statusMessage = "Wartet auf Scan..."
-                }
-
-            } catch {
-                if (error as? URLError)?.code == .notConnectedToInternet {
-                    offlineQueue.enqueue(cardId: cardId, stamps: 1, comment: "Stempel von: \(employeeName)")
-                    await MainActor.run {
-                        self.statusMessage = "Offline — Stempel in Warteschlange"
-                        self.isProcessing = false
-                    }
-                } else {
-                    await MainActor.run {
-                        self.showErrorMessage(error.localizedDescription)
-                        self.isProcessing = false
-                    }
-                }
-            }
+        switch scanMode {
+        case .stamp:
+            Task { await addStamp(cardId: cardId) }
+        case .redeem:
+            Task { await prepareRedeem(cardId: cardId) }
         }
     }
 
-    private func showErrorMessage(_ message: String) {
-        errorMessage = message
-        showError = true
-        statusMessage = message
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-            self.showError = false
-            self.statusMessage = "Wartet auf Scan..."
+    // MARK: - Stamp
+
+    private func addStamp(cardId: String) async {
+        isLoading = true
+        do {
+            let card = try await apiService.stampCard(cardId: cardId, stamps: 1, comment: "Scan via iOS POS")
+            lastCard = card
+            successMessage = "✓ Stempel gegeben (\(card.currentStamps)/\(card.maxStamps))"
+        } catch APIError.cardNotFound(_) {
+            errorMessage = "Karte nicht gefunden"
+        } catch APIError.unauthorized {
+            errorMessage = "Nicht eingeloggt"
+        } catch {
+            offlineQueue.enqueue(cardId: cardId, stamps: 1, comment: "Offline")
+            successMessage = "Offline gespeichert — wird sync wenn online"
+        }
+        isLoading = false
+    }
+
+    // MARK: - Redeem
+
+    private func prepareRedeem(cardId: String) async {
+        isLoading = true
+        do {
+            let card = try await apiService.getCard(id: cardId)
+            lastCard = card
+            let rewards = card.availableRewardTiers
+
+            if rewards.isEmpty {
+                errorMessage = "Kein Reward verfügbar"
+                isLoading = false
+            } else if rewards.count == 1 {
+                await redeemReward(cardId: cardId, rewardId: rewards[0].id)
+            } else {
+                availableRewards = rewards
+                pendingCardId = cardId
+                showRewardPicker = true
+                isLoading = false
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+            isLoading = false
         }
     }
 
-    func replayOfflineQueue() {
-        Task {
-            let result = await offlineQueue.replay(using: api)
-            await MainActor.run {
-                self.statusMessage = "Offline-Queue: \(result.success) erfolgreich, \(result.failed) fehlgeschlagen"
-            }
+    func redeemSelected(rewardId: Int) {
+        guard let cardId = pendingCardId else { return }
+        showRewardPicker = false
+        Task { await redeemReward(cardId: cardId, rewardId: rewardId) }
+    }
+
+    private func redeemReward(cardId: String, rewardId: Int) async {
+        isLoading = true
+        do {
+            let card = try await apiService.receiveReward(cardId: cardId, rewardId: rewardId, comment: "Einlösen via iOS POS")
+            lastCard = card
+            successMessage = "✓ Reward eingelöst"
+        } catch {
+            errorMessage = error.localizedDescription
         }
+        isLoading = false
+    }
+
+    // MARK: - Helpers
+
+    func clearMessages() {
+        errorMessage = nil
+        successMessage = nil
     }
 }

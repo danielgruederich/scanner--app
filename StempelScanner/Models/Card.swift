@@ -19,6 +19,10 @@ struct Card: Codable, Identifiable {
     var status: String?
     var expiresAt: String?
     var couponRedeemed: Bool?
+
+    // Computed für ScanView
+    var currentStamps: Int { balance.currentNumberOfUses ?? 0 }
+    var maxStamps: Int { balance.numberStampsTotal ?? 10 }
 }
 
 struct CardCustomer: Codable {
